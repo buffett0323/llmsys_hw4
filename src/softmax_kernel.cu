@@ -150,7 +150,37 @@ __global__ void ker_attn_softmax(T *inp, const T *attn_mask, int from_len,
     /* step 1. compute max */
     // thread local max
     // BEGIN ASSIGN4_1_1
-    
+    float val[token_per_reduce][ele_per_thread]; // for calculation
+    float l_max[token_per_reduce]; // thread register
+
+    #pragma unroll
+    for (int i = 0; i < token_per_reduce; i++) {
+      l_max[i] = REDUCE_FLOAT_INF_NEG;
+      int current_token_pos = token_id + i;
+
+      #pragma unroll
+      for (int j = 0; j < ele_per_thread; j++) {
+        // the current element in the whole to_len sequence
+        int col_idx = ele_per_thread * threadIdx.x + j;
+        
+        float temp_val;
+        if (col_idx >= to_len) {
+          temp_val = REDUCE_FLOAT_INF_NEG;
+        } else if (mask_future && col_idx > current_token_pos) {
+          // future tokens are masked
+          temp_val = REDUCE_FLOAT_INF_NEG;
+        } else {
+          temp_val = (float)inp_val[i][j];
+          if (attn_mask) { // Add attention mask if needed
+            temp_val += (float)mval[j];
+          }
+        }
+        
+        val[i][j] = temp_val;
+        l_max[i] = fmaxf(l_max[i], temp_val); // update the thread local max
+      }
+    }
+
     // END ASSIGN4_1_1
     // block reduce max
     blockReduce<ReduceType::kMax, token_per_reduce>(l_max);
@@ -166,6 +196,17 @@ __global__ void ker_attn_softmax(T *inp, const T *attn_mask, int from_len,
     /* step 2. compute sum */
     // thread local sum
     // BEGIN ASSIGN4_1_1
+
+    float l_sum[token_per_reduce];
+    #pragma unroll
+    for (int i = 0; i < token_per_reduce; i++) {
+      l_sum[i] = 0.0f;
+      for (int j = 0; j < ele_per_thread; j++) {
+        // Get the global max value from shared memory from step 1.
+        val[i][j] = __expf(val[i][j] - s_max[i]);
+        l_sum[i] += val[i][j];
+      }
+    }
     
     // END ASSIGN4_1_1
     // block reduce sum
@@ -181,7 +222,19 @@ __global__ void ker_attn_softmax(T *inp, const T *attn_mask, int from_len,
 
     /* step 3. compute final result */
     // BEGIN ASSIGN4_1_1
-   
+    #pragma unroll
+    for (int i = 0; i < token_per_reduce && (token_id + i) < from_len; i++) {
+      // Get the final result from shared memory from step 2.
+      float inv_sum = s_sum[i];
+      
+      #pragma unroll
+      for (int j = 0; j < ele_per_thread; j++) {
+        // Normalization: val[i][j] holds exp(x - max) from Step 2
+        inp_val[i][j] = (T)(val[i][j] * inv_sum);
+      }
+      BlockStore(ts_store).Store(inp + (token_id + i) * to_len, inp_val[i],
+                                 to_len); // write back to global memory
+    }
     // END ASSIGN4_1_1
   }  // blockIdx.x
 }
