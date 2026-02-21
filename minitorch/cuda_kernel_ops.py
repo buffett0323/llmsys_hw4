@@ -406,13 +406,67 @@ class CudaKernelOps(TensorOps):
     @staticmethod
     def attn_softmax_bw(out_grad: Tensor, soft_inp: Tensor):
       #   BEGIN ASSIGN4_1_2
-      raise("Not implemented")
+      batch_size, nhead, seq_len, softmax_len = soft_inp.shape
+      stream = torch.cuda.current_stream().cuda_stream
+
+      lib_softmax.launch_attn_softmax_bw.argtypes = [
+        # ctypes.c_void_p,
+        # ctypes.c_void_p,
+        np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+        np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_void_p,
+      ]
+      lib_softmax.launch_attn_softmax_bw.restype = None
+      
+      lib_softmax.launch_attn_softmax_bw(
+        out_grad._tensor._storage,
+        soft_inp._tensor._storage,
+        batch_size * nhead * seq_len,
+        softmax_len,
+        stream,
+      )
+      return out_grad
       #   END ASSIGN4_1_2
 
     @staticmethod
     def layernorm_fw(inp: Tensor, gamma: Tensor, beta: Tensor):
       #   BEGIN ASSIGN4_2_1
-      raise("Not implemented")
+    #   raise("Not implemented")
+        batch_size = inp.size // inp.shape[-1]
+        hidden_dim = inp.shape[-1]
+        stream = torch.cuda.current_stream().cuda_stream
+
+        out = inp.zeros(inp.shape)
+        vars_tensor = inp.zeros((batch_size,))
+        means_tensor = inp.zeros((batch_size,))
+
+        lib_layernorm.launch_layernorm.argtypes = [
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'), # ln_res
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'), # vars
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'), # means
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'), # inp
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'), # scale
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'), # bias
+            ctypes.c_int, # batch_size
+            ctypes.c_int, # hidden_dim
+            ctypes.c_void_p # stream
+        ]
+        lib_layernorm.launch_layernorm.restype = None
+
+        lib_layernorm.launch_layernorm(
+            out._tensor._storage,
+            vars_tensor._tensor._storage,
+            means_tensor._tensor._storage,
+            inp._tensor._storage,
+            gamma._tensor._storage,
+            beta._tensor._storage,
+            batch_size,
+            hidden_dim,
+            stream
+        )
+        return out, means_tensor, vars_tensor
       #   END ASSIGN4_2_1
       
     @staticmethod

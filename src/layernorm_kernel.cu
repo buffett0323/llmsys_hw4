@@ -28,7 +28,7 @@ blockDim.x = hidden_size
 @param
 ln_res: [batch_size * seq_len, hidden_size], ln result.
 vars: [batch_size * seq_len], variance per token
-means: [batch_size * seq_len], means per token, can be nullput
+means: [batch_size * seq_len], means per token, can be nullptr
 inp: [batch_size * seq_len, hidden_size], ln input.
 scale: [hidden_size], ln scale
 bias: [hidden_size], ln bias
@@ -45,18 +45,52 @@ __global__ void ker_layer_norm(T *ln_res, T *vars, T *means, const T *inp,
   // 3. Compute layernorm result with reinterpret_cast by casting to float4 for speedup
   
   // Step 1
-  float l_sum = 0;
-  const float4 *inp_f4 = reinterpret_cast<const float4 *>(inp) + blockIdx.x * hidden_size;  
+  float l_sum = 0.0f;
+  float l_sum_sq = 0.0f;
+
+  const float4 *inp_f4 = reinterpret_cast<const float4 *>(inp) + blockIdx.x * hidden_size;  // cast to float4
   for (uint idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
-    float4 val = inp_f4[idx];
+    float4 val = inp_f4[idx]; // read 128 bits
     l_sum += val.x + val.y + val.z + val.w;
+    l_sum_sq += val.x * val.x + val.y * val.y + val.z * val.z + val.w * val.w;
   }
 
   // Step 2
+  // Block reduction
+  float block_combo[2] = {l_sum, l_sum_sq};
+  blockReduce<ReduceType::kSum, 2>(block_combo);
+
+  __shared__ float s_mean, s_inv_std;
+
+  if (threadIdx.x == 0) {
+    s_mean = block_combo[0] / (hidden_size * 4);
+    float s_var = block_combo[1] / (hidden_size * 4) - (s_mean * s_mean) + LN_EPSILON;
+
+    if (means) means[blockIdx.x] = s_mean;
+    vars[blockIdx.x] = s_var;
+    s_inv_std = rsqrtf(s_var + LN_EPSILON); // count inv_std first
+  }
+  __syncthreads();
 
   // Step 3
-  
-  assert(false && "Not Implemented");
+  // Normalize and Affine Transform
+  float4 *ln_res_f4 = reinterpret_cast<float4 *>(ln_res) + blockIdx.x * hidden_size;
+  const float4 *scale_f4 = reinterpret_cast<const float4 *>(scale);
+  const float4 *bias_f4 = reinterpret_cast<const float4 *>(bias);
+
+  for (uint idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+    float4 val = inp_f4[idx];
+    float4 s = scale_f4[idx];
+    float4 b = bias_f4[idx];
+
+    // y = gamma * ((x - mu) * inv_std) + beta
+    float4 out;
+    out.x = (val.x - s_mean) * s_inv_std * s.x + b.x;
+    out.y = (val.y - s_mean) * s_inv_std * s.y + b.y;
+    out.z = (val.z - s_mean) * s_inv_std * s.z + b.z;
+    out.w = (val.w - s_mean) * s_inv_std * s.w + b.w;
+    ln_res_f4[idx] = out;
+  }
   /// END ASSIGN4_2_1
 }
 
@@ -125,7 +159,7 @@ void launch_layernorm(float *ln_res, float *vars, float *means,
 
 /**
 @brief: ker_ln_bw_dgamma_dbetta
-Layer norm backword kernel, compute the gradient of gamma and betta.
+Layer norm backward kernel, compute the gradient of gamma and betta.
 dbetta = sum(dout, dim=0)
 dgamma = sum(xhat * dout, dim=0)
 xhat = (input - mean) * rsqrt(var) or
@@ -191,7 +225,7 @@ __global__ void ker_ln_bw_dgamma_dbetta(T *gamma_grad, T *betta_grad,
 
 /**
 @brief: ker_ln_bw_dinp
-Layer norm backword kernel, compute the gradient of input.
+Layer norm backward kernel, compute the gradient of input.
 dinp = (dxhat - (sum(dxhat) + xhat * sum(dxhat * xhat)) / hidden_dim)
   * rsqrt(var)
 xhat = (input - mean) * rsqrt(var) if mean is not nullptr
