@@ -57,14 +57,14 @@ __global__ void ker_layer_norm(T *ln_res, T *vars, T *means, const T *inp,
 
   // Step 2
   // Block reduction
-  float block_combo[2] = {l_sum, l_sum_sq};
-  blockReduce<ReduceType::kSum, 2>(block_combo);
+  float block_storing[2] = {l_sum, l_sum_sq};
+  blockReduce<ReduceType::kSum, 2>(block_storing);
 
   __shared__ float s_mean, s_inv_std;
 
   if (threadIdx.x == 0) {
-    s_mean = block_combo[0] / (hidden_size * 4);
-    float s_var = block_combo[1] / (hidden_size * 4) - (s_mean * s_mean) + LN_EPSILON;
+    s_mean = block_storing[0] / (hidden_size * 4);
+    float s_var = block_storing[1] / (hidden_size * 4) - (s_mean * s_mean) + LN_EPSILON;
 
     if (means) means[blockIdx.x] = s_mean;
     vars[blockIdx.x] = s_var;
@@ -205,21 +205,46 @@ __global__ void ker_ln_bw_dgamma_dbetta(T *gamma_grad, T *betta_grad,
   //      -> Now g.shfl_down helps you do so without consuming any shared memory. g.shfl_down makes it more efficient.
   // 4. Assign the final result to the correct position in the global output
 
-  __shared__ float betta_buffer[TILE_DIM][TILE_DIM];
-  __shared__ float gamma_buffer[TILE_DIM][TILE_DIM];
-
   cg::thread_block b = cg::this_thread_block();
   cg::thread_block_tile<TILE_DIM> g = cg::tiled_partition<TILE_DIM>(b);
 
-  // Step 1
+  // Swap roles: threadIdx.x = row (reduction dim), threadIdx.y = column
+  // So tiled_partition<32> groups (0,ty)..(31,ty) - same column, different rows
+  // shfl_down then reduces over threadIdx.x (rows) as needed
+  int col_idx = blockIdx.x * TILE_DIM + threadIdx.y;
 
-  // Step 2
-  
-  // Step 3
-  
-  // Step 4
+  // Step 1 - each thread (tx, ty) computes partial for column ty from rows tx, tx+32, ...
+  float dbeta_sum = 0.0f;
+  float dgamma_sum = 0.0f;
+  if (col_idx < width) {
+    for (int idx = threadIdx.x; idx < rows; idx += TILE_DIM) {
+      float dout = out_grad[idx * width + col_idx];
+      float mean = means[idx];
+      float var = vars[idx];
+      float inp_val = inp[idx * width + col_idx];
+      float xhat = (inp_val - mean) * rsqrtf(var + LN_EPSILON);
 
-  assert(false && "Not Implemented");
+      dbeta_sum += dout;
+      dgamma_sum += xhat * dout;
+    }
+  }
+
+  // Step 2 & 3 - reduce over threadIdx.x using shfl_down (no shared memory needed)
+  float beta_sum = dbeta_sum;
+  float gamma_sum = dgamma_sum;
+  #pragma unroll
+  for (int stride = TILE_DIM / 2; stride > 0; stride >>= 1) {
+    beta_sum += g.shfl_down(beta_sum, stride);
+    gamma_sum += g.shfl_down(gamma_sum, stride);
+  }
+
+  // Step 4 - thread with threadIdx.x==0 has the reduced sum for its column
+  if (threadIdx.x == 0 && col_idx < width) {
+    betta_grad[col_idx] = beta_sum;
+    gamma_grad[col_idx] = gamma_sum;
+  }
+
+  // assert(false && "Not Implemented");
   /// END ASSIGN4_2_2
 }
 
@@ -267,14 +292,67 @@ __global__ void ker_ln_bw_dinp(T *inp_grad, const T *out_grad, const T *inp,
   // 4. Compute final gradient
   
   // Step 1
- 
-  // Step 2
+  float4 dxhat, xhat;
+  float meanf = means[blockIdx.x];
+  float varf = vars[blockIdx.x];
+  float inv_std = rsqrtf(varf + LN_EPSILON);                                
+
+  if (threadIdx.x < hidden_dim) {
+    // output grad and multiply gamma
+    dxhat = reinterpret_cast<const float4 *>(out_grad)[blockIdx.x * hidden_dim + threadIdx.x];
+    float4 gamma_f4 = reinterpret_cast<const float4 *>(gamma)[threadIdx.x];
+
+    // gamma scaling
+    dxhat.x *= gamma_f4.x;
+    dxhat.y *= gamma_f4.y;
+    dxhat.z *= gamma_f4.z;
+    dxhat.w *= gamma_f4.w;
+
+    // Step 2
+    // input and normalize
+    xhat = reinterpret_cast<const float4 *>(inp)[blockIdx.x * hidden_dim + threadIdx.x];
+
+    // normalize
+    xhat.x = (xhat.x - meanf) * inv_std;
+    xhat.y = (xhat.y - meanf) * inv_std;
+    xhat.z = (xhat.z - meanf) * inv_std;
+    xhat.w = (xhat.w - meanf) * inv_std;
+    
+  }
    
   // Step 3
- 
-  // Step 4
+  // compute reduce sum for dxhat and dxhat*xhat
+  float vals[2] = {0.0f, 0.0f};
+  if (threadIdx.x < hidden_dim) {
+    // sum of grads and dot product
+    vals[0] += dxhat.x + dxhat.y + dxhat.z + dxhat.w;
+    vals[1] += xhat.x * dxhat.x + xhat.y * dxhat.y + xhat.z * dxhat.z + xhat.w * dxhat.w;
+  }
+
+  // reduction sum
+  blockReduce<ReduceType::kSum, 2>(vals);
+  __syncthreads();
+
+  // store reduction results in shared memory
+  __shared__ float s_sum_dxhat, s_sum_dxhat_xhat;
+  if (threadIdx.x == 0) {
+    float mean_dim = hidden_dim * 4;
+    s_sum_dxhat = vals[0] / mean_dim;
+    s_sum_dxhat_xhat = vals[1] / mean_dim;
+  }
+  __syncthreads();
+
+  // Step 4 - only threads with valid data should compute and write
+  if (threadIdx.x < hidden_dim) {
+    dxhat.x = (dxhat.x - (s_sum_dxhat + s_sum_dxhat_xhat * xhat.x)) * inv_std;
+    dxhat.y = (dxhat.y - (s_sum_dxhat + s_sum_dxhat_xhat * xhat.y)) * inv_std;
+    dxhat.z = (dxhat.z - (s_sum_dxhat + s_sum_dxhat_xhat * xhat.z)) * inv_std;
+    dxhat.w = (dxhat.w - (s_sum_dxhat + s_sum_dxhat_xhat * xhat.w)) * inv_std;
+
+    reinterpret_cast<float4 *>(inp_grad)[blockIdx.x * hidden_dim + threadIdx.x] = dxhat;
+  }
   
-  assert(false && "Not Implemented");
+  // assert(false && "Not Implemented");
   /// END ASSIGN4_2_2
 }
 extern "C" {

@@ -472,6 +472,49 @@ class CudaKernelOps(TensorOps):
     @staticmethod
     def layernorm_bw(out_grad: Tensor, inp: Tensor, gamma: Tensor, beta: Tensor, var: Tensor, mean: Tensor):
       #   BEGIN ASSIGN4_2_2
-      raise("Not implemented")
+    #   raise("Not implemented")
+        batch_size = inp.size // inp.shape[-1]
+        hidden_dim = inp.shape[-1]
+        
+        gamma_grad = gamma.zeros(gamma.shape)
+        beta_grad = beta.zeros(beta.shape)
+        inp_grad = inp.zeros(inp.shape)
+
+        lib_layernorm.launch_layernorm_bw.argtypes = [
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'), # gamma_grad
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'), # betta_grad
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'), # inp_grad
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'), # out_grad
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'), # inp
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'), # gamma
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'), # beta
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'), # var
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'), # mean
+            ctypes.c_int, # batch_size
+            ctypes.c_int, # hidden_dim
+            ctypes.c_void_p, # stream_1
+            ctypes.c_void_p  # stream_2
+        ]
+        lib_layernorm.launch_layernorm_bw.restype = None
+
+        stream = torch.cuda.current_stream().cuda_stream
+
+        lib_layernorm.launch_layernorm_bw(
+            gamma_grad._tensor._storage,
+            beta_grad._tensor._storage,
+            inp_grad._tensor._storage,
+            out_grad._tensor._storage,
+            inp._tensor._storage,
+            gamma._tensor._storage,
+            beta._tensor._storage,
+            var._tensor._storage,
+            mean._tensor._storage,
+            np.int32(batch_size),
+            np.int32(hidden_dim),
+            stream, # stream_1
+            stream  # stream_2
+        )
+        
+        return inp_grad, gamma_grad, beta_grad
       #   END ASSIGN4_2_2
       
