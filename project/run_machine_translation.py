@@ -393,7 +393,8 @@ def main(
     n_vocab=10000,
     n_embd=256,
     seed=11111,
-    resume_from_epoch=None
+    resume_from_epoch=None,
+    use_fused_kernel=True
 ):
     """
     Train and evaluate a decoder-only transformer language model.
@@ -409,6 +410,7 @@ def main(
         n_embd (int): Embedding dimension, default 256
         seed (int): Random seed, default 11111
         resume_from_epoch (int): If set, load checkpoint_epoch{resume_from_epoch-1}.npz and train from this epoch (tokenizer loaded from workdir)
+        use_fused_kernel (bool): If True, use fused CUDA kernels for layernorm; if False, use basic ops. Default True.
     """
 
     np.random.seed(seed)
@@ -427,9 +429,11 @@ def main(
         # 'n_layer'     : 4,    # n_layer
         'p_dropout': 0.1,  # x_pdrop
         'ln_eps': 1e-5,  # layer_norm_epsilon
-        'backend': backend
+        'backend': backend,
+        'use_fused_kernel': use_fused_kernel
     }
 
+    print(f'use_fused_kernel={use_fused_kernel} (fused softmax in attention + layernorm in all 9 LayerNorm layers)')
     model = DecoderLM(**config)
     optimizer = minitorch.Adam(model.parameters(), lr=learning_rate)
 

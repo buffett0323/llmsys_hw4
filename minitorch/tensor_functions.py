@@ -389,19 +389,27 @@ class MatMul(Function):
 
 
 class Attn_Softmax(Function):
+    """
+    Fused attention softmax. When mask.size == 1, treats as causal mode
+    (decoder self-attention with mask_future); otherwise uses the given mask.
+    """
     @staticmethod
     def forward(ctx: Context, inp: Tensor, mask: Tensor) -> Tensor:
         # BEGIN ASSIGN4_1_1
-        out = inp.f.attn_softmax_fw(inp, mask)
+        batch_size, nhead, from_len, to_len = inp.shape
+        is_causal = mask.size == 1  # sentinel: 1-element tensor indicates causal
+        if is_causal:
+            mask = zeros_tensor_from_numpy((batch_size, to_len), backend=inp.backend)
+        out = inp.f.attn_softmax_fw(inp, mask, is_dec_self_attn=is_causal)
         ctx.save_for_backward(out)
         return out
         # END ASSIGN4_1_1
 
     @staticmethod
-    def backward(ctx: Context, out_grad: Tensor) -> Tensor:
+    def backward(ctx: Context, out_grad: Tensor) -> Tuple[Tensor, ...]:
         # BEGIN ASSIGN4_1_2
-        (inp, ) = ctx.saved_values
-        res = out_grad.f.attn_softmax_bw(out_grad, inp)
+        (soft_out,) = ctx.saved_values
+        res = out_grad.f.attn_softmax_bw(out_grad, soft_out)
         return res, out_grad.zeros(out_grad.shape)
         # END ASSIGN4_1_2
 

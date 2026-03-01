@@ -20,7 +20,7 @@ datatype = np.float32
 
 
 class MultiHeadAttention(Module):
-    def __init__(self, n_embd: int, n_head: int, causal: bool=True, p_dropout: float=0.1, bias: bool=True, backend: TensorBackend=None):
+    def __init__(self, n_embd: int, n_head: int, causal: bool=True, p_dropout: float=0.1, bias: bool=True, backend: TensorBackend=None, use_fused_kernel: bool=False):
         super().__init__()
         """Implements Multi-Head Attention as described in "Attention Is All You Need"
 
@@ -42,6 +42,7 @@ class MultiHeadAttention(Module):
         self.n_embd = n_embd 
         self.n_head = n_head
         self.causal = causal
+        self.use_fused_kernel = use_fused_kernel
         self.attn_hidden_dim = n_embd // n_head
 
         ### BEGIN ASSIGN3_3
@@ -123,11 +124,13 @@ class MultiHeadAttention(Module):
         # raise NotImplementedError
         attn_scores = (q @ kT) / (q_dim ** 0.5)
         
-        if self.causal:
-            mask = self.create_causal_mask(queries_len)
-            attn_scores = attn_scores + mask
-        
-        attn_weights = softmax(attn_scores, dim=3)
+        if self.use_fused_kernel and self.causal:
+            attn_weights = attn_scores.attn_softmax_causal()
+        else:
+            if self.causal:
+                mask = self.create_causal_mask(queries_len)
+                attn_scores = attn_scores + mask
+            attn_weights = softmax(attn_scores, dim=3)
         attn_weights = self.dropout(attn_weights)
         
         # (B, H, S, S) @ (B, H, S, Dv) -> (B, H, S, Dv)
@@ -203,7 +206,8 @@ class FeedForward(Module):
     
 
 class TransformerLayer(Module):
-    def __init__(self, n_embd: int, n_head: int, p_dropout: float=0.1, ln_eps: float=1e-5, bias: bool=True, backend: TensorBackend=None):
+    def __init__(self, n_embd: int, n_head: int, p_dropout: float=0.1, ln_eps: float=1e-5, 
+                 bias: bool=True, backend: TensorBackend=None, use_fused_kernel: bool=False):
         super().__init__()
         """
         Initialize a transformer layer with pre-layer normalization.
@@ -215,6 +219,7 @@ class TransformerLayer(Module):
             ln_eps (float): Layer normalization epsilon, default 1e-5
             bias (bool): Whether to use bias in linear layers, default True
             backend (TensorBackend): Backend for tensor operations
+            use_fused_kernel (bool): Whether to use fused CUDA kernels for layer norm, default False
             
         Attributes:
             ln_1 (LayerNorm1d): First layer normalization before attention
@@ -224,9 +229,9 @@ class TransformerLayer(Module):
         """
         ### BEGIN ASSIGN3_3
         # raise NotImplementedError
-        self.ln_1 = LayerNorm1d(n_embd, eps=ln_eps, backend=backend)
-        self.ln_2 = LayerNorm1d(n_embd, eps=ln_eps, backend=backend)
-        self.attention = MultiHeadAttention(n_embd, n_head, causal=True, p_dropout=p_dropout, bias=bias, backend=backend)
+        self.ln_1 = LayerNorm1d(n_embd, eps=ln_eps, backend=backend, use_fused_kernel=use_fused_kernel)
+        self.ln_2 = LayerNorm1d(n_embd, eps=ln_eps, backend=backend, use_fused_kernel=use_fused_kernel)
+        self.attention = MultiHeadAttention(n_embd, n_head, causal=True, p_dropout=p_dropout, bias=bias, backend=backend, use_fused_kernel=use_fused_kernel)
         self.ff = FeedForward(n_embd, middle_dim=256, p_dropout=p_dropout, bias=bias, backend=backend)
         ### END ASSIGN3_3
 
@@ -299,10 +304,10 @@ class DecoderLM(Module):
         # raise NotImplementedError
         self.token_embeddings = Embedding(n_vocab, n_embd, backend=backend)
         self.position_embeddings = Embedding(n_positions, n_embd, backend=backend)
-        self.t_layer_1 = TransformerLayer(n_embd, n_head, p_dropout=p_dropout, ln_eps=ln_eps, bias=bias, backend=backend)
-        self.t_layer_2 = TransformerLayer(n_embd, n_head, p_dropout=p_dropout, ln_eps=ln_eps, bias=bias, backend=backend)
-        self.t_layer_3 = TransformerLayer(n_embd, n_head, p_dropout=p_dropout, ln_eps=ln_eps, bias=bias, backend=backend)
-        self.t_layer_4 = TransformerLayer(n_embd, n_head, p_dropout=p_dropout, ln_eps=ln_eps, bias=bias, backend=backend)
+        self.t_layer_1 = TransformerLayer(n_embd, n_head, p_dropout=p_dropout, ln_eps=ln_eps, bias=bias, backend=backend, use_fused_kernel=use_fused_kernel)
+        self.t_layer_2 = TransformerLayer(n_embd, n_head, p_dropout=p_dropout, ln_eps=ln_eps, bias=bias, backend=backend, use_fused_kernel=use_fused_kernel)
+        self.t_layer_3 = TransformerLayer(n_embd, n_head, p_dropout=p_dropout, ln_eps=ln_eps, bias=bias, backend=backend, use_fused_kernel=use_fused_kernel)
+        self.t_layer_4 = TransformerLayer(n_embd, n_head, p_dropout=p_dropout, ln_eps=ln_eps, bias=bias, backend=backend, use_fused_kernel=use_fused_kernel)
         self.dropout = Dropout(p_dropout)
         self.lm_head = Linear(n_embd, n_vocab, bias=bias, backend=backend)
         ### END ASSIGN3_3

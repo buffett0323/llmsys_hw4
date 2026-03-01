@@ -141,13 +141,15 @@ class Linear(Module):
 
 
 class LayerNorm1d(Module):
-    def __init__(self, dim: int, eps: float, backend: TensorBackend):
+    def __init__(self, dim: int, eps: float, backend: TensorBackend, use_fused_kernel: bool = False):
         super().__init__()
         """Applies Layer Normalization over a mini-batch of 1-dimensional inputs.
         
         Args: 
             dim : Expected size of the last dimension to apply layer normalization.
             eps : A value added for numerical stability.
+            backend : Backend for tensor operations.
+            use_fused_kernel : If True, use fused CUDA layernorm kernel; else use basic ops.
         
         Attributes: 
             weights : the learnable weights of the module of shape (self.dim, ) initialized to 1.
@@ -155,6 +157,7 @@ class LayerNorm1d(Module):
         """
         self.dim = dim
         self.eps = eps
+        self.use_fused_kernel = use_fused_kernel
         
         # COPY FROM ASSIGN2_3
         self.weights = Parameter(tensor_from_numpy(np.ones(dim), backend=backend))
@@ -172,11 +175,19 @@ class LayerNorm1d(Module):
             output - Tensor of shape (bs, dim)
         """
         batch, dim = x.shape
-        
-        # COPY FROM ASSIGN2_3
         x = x.view(batch, dim)
         weights = self.weights.value.view(1, dim)
         bias = self.bias.value.view(1, dim)
-        output = (x - x.mean(dim=1)) / (x.var(dim=1) + self.eps) ** 0.5 * weights + bias.view(1, dim)
+
+        if self.use_fused_kernel:
+            from .tensor_functions import LayerNorm
+            # LayerNorm expects gamma, beta of shape (dim,)
+            gamma = self.weights.value
+            beta = self.bias.value
+            output = LayerNorm.apply(x, gamma, beta)
+        else:
+            # COPY FROM ASSIGN2_3 - basic ops implementation
+            output = (x - x.mean(dim=1)) / (x.var(dim=1) + self.eps) ** 0.5 * weights + bias.view(1, dim)
+
         return output.view(batch, dim)
         

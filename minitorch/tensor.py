@@ -423,5 +423,10 @@ class Tensor:
     def attn_softmax(self, mask: Tensor) -> Tensor:
       return Attn_Softmax.apply(self, mask)
 
+    def attn_softmax_causal(self) -> Tensor:
+      """Fused softmax for causal (decoder) self-attention. Uses 1-element sentinel as mask."""
+      sentinel = tensor([0.0], backend=self.backend)
+      return Attn_Softmax.apply(self, sentinel)
+
     def layernorm(self, gamma: Tensor, beta: Tensor) -> Tensor:
       return LayerNorm.apply(self, gamma, beta)
